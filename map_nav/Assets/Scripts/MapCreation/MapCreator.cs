@@ -2,35 +2,43 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using Tools;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace MapCreation
 {
     public class MapCreator : MonoBehaviour
     {
-        [SerializeField] private float _edgeLength = 1.0f;
-        [SerializeField] private float _inerLength;
-        [SerializeField] private float _halfInerLength;
-        [SerializeField] private float _offset = 0.75f;
+        private float _edgeLength = 1.0f;
+        private float _inerLength;
+        private float _offset = 1.5f;
+        private float _doubleInerLength;
         [SerializeField] private List<Vector3Int> _hexPosOffset = new List<Vector3Int>();
         [SerializeField] private List<Vector3> _worldPosOffset = new List<Vector3>();
-        [SerializeField] public bool isEditing;
-        [SerializeField] public bool isDeleting;
-        [SerializeField] private Vector3 hexRatation = new Vector3(90, 0, 0);
+
+        private Vector3 hexRatation = new Vector3(0, 0, 0);
         private Dictionary<Vector3Int, HexProperty> m_PosToHex = new Dictionary<Vector3Int, HexProperty>();
 
         private MapInfo m_MapInfo = new MapInfo();
 
         private GameObject tile;
         private Transform tilesParent;
+        
+        [SerializeField] public bool isEditing;
+        [SerializeField] public bool isDeleting;
+        [SerializeField] public bool Navigation;
+        private bool isNaving;
         /// <summary>
-        /// 初始化坐标偏移
+        /// 初始化坐标偏移 
         /// 读取地图信息，放入字典中
         /// </summary>
         void Start()
         {
+            isNaving = false;
             _inerLength = (_edgeLength / 2) * Mathf.Sqrt(3);
-            _halfInerLength = _inerLength / 2;
+            _doubleInerLength = _inerLength * 2;
             _hexPosOffset.Add(new Vector3Int(1, -1, 0));
             _hexPosOffset.Add(new Vector3Int(1, 0, -1));
             _hexPosOffset.Add(new Vector3Int(0, 1, -1));
@@ -38,12 +46,13 @@ namespace MapCreation
             _hexPosOffset.Add(new Vector3Int(-1, 0, 1));
             _hexPosOffset.Add(new Vector3Int(0, -1, 1));
 
-            _worldPosOffset.Add(new Vector3(_offset, 0, -_halfInerLength));
-            _worldPosOffset.Add(new Vector3(_offset, 0, _halfInerLength));
-            _worldPosOffset.Add(new Vector3(0, 0, _inerLength));
-            _worldPosOffset.Add(new Vector3(-_offset, 0, _halfInerLength));
-            _worldPosOffset.Add(new Vector3(-_offset, 0, -_halfInerLength));
-            _worldPosOffset.Add(new Vector3(0, 0, -_inerLength));
+            _worldPosOffset.Add(new Vector3(_inerLength, 0, -_offset));
+            _worldPosOffset.Add(new Vector3(_doubleInerLength, 0, 0));
+            _worldPosOffset.Add(new Vector3(_inerLength, 0, _offset));
+            _worldPosOffset.Add(new Vector3(-_inerLength, 0, _offset));
+            _worldPosOffset.Add(new Vector3(-_doubleInerLength, 0, 0));
+            _worldPosOffset.Add(new Vector3(-_inerLength, 0, -_offset));
+
             
             tile = Resources.Load<GameObject>("Prefab/tilemap");
             tilesParent = GameObject.Find("Map").transform;
@@ -67,7 +76,13 @@ namespace MapCreation
                 tmpVector3Int = m_MapInfo.hexPosInfo[i];
                 tmpVector3 = m_MapInfo.worldPosInfo[i];
                 GenerateHexObject(tmpVector3Int, tmpVector3, i);
-                
+            }
+
+            HexProperty tmp;
+            for (int i = 0; i < m_MapInfo.hexPosInfo.Count; ++i)
+            {
+                tmp = m_PosToHex[m_MapInfo.hexPosInfo[i]];
+                UpdateList(tmp);
             }
         }
 
@@ -102,6 +117,19 @@ namespace MapCreation
             //Debug.Log(saveJsonStr);
         }
 
+        void ResetMap()
+        {
+            m_MapInfo.worldPosInfo.Clear();
+            m_MapInfo.hexPosInfo.Clear();
+            m_MapInfo.hexPosInfo.Add(Vector3Int.zero);
+            m_MapInfo.worldPosInfo.Add(Vector3.zero);
+            for (int i = 1; i < tilesParent.childCount; ++i)
+            {
+                Destroy(tilesParent.GetChild(i));
+            }
+            tilesParent.GetChild(0).GetComponent<HexProperty>().adjacentTiles.Clear();
+        }
+
         private void OnEnable()
         {
             throw new NotImplementedException();
@@ -120,30 +148,166 @@ namespace MapCreation
         // Update is called once per frame
         void Update()
         {
-            if (isEditing)
-            {
-                CheckMouseInput();
-            }
+            CheckMouseInput();
         }
 
         void CheckMouseInput()
         {
             if (Input.GetMouseButtonDown(0))
             {
-                Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
-                // Debug.Log("Mouse Position is " + Input.mousePosition.ToString());
-                RaycastHit hit;
-                if (Physics.Raycast(ray, out hit))
+                var hex = GetClickedHex();
+                if (hex == null) return;
+                if (isEditing)
                 {
-                    var hex = hit.collider.transform.GetComponent<HexProperty>();
-                    if (hex != null)
+                    GenerateHex(hex);
+                }
+                else if (isDeleting)
+                {
+                    DeleteHex(hex);
+                }
+                else if (Navigation && !isNaving)
+                {
+                    isNaving = true;
+                    foreach (var pathNode in lastPath)
                     {
-                        GenerateHex(hex);
+                        pathNode.Material.color = Color.white;
                     }
+                    lastPath.Clear();
+                    hex.Material.color = Color.red;
+                    StartCoroutine(Navigate(hex.hexPosition));
                 }
             }
         }
 
+        #region Nav
+
+        private List<HexProperty> lastPath = new List<HexProperty>();
+
+        IEnumerator Navigate(Vector3Int startPos)
+        {
+            yield return new WaitForSeconds(0.5f);
+            Debug.Log("Start!");
+            while (!Input.GetMouseButton(0))
+            {
+                yield return null;
+            }
+
+            var endHex = GetClickedHex();
+            endHex.Material.color = Color.red;
+
+            if(endHex == null) Debug.Log("Can't Get end Point");
+            var endPos = endHex.hexPosition;
+
+            PriorityQueue<HexProperty> queue = new PriorityQueue<HexProperty>();
+            var startHex = m_PosToHex[startPos];
+            startHex.parent = null;
+            startHex.distanceToStart = 0;
+            queue.Add(startHex);
+            StartCoroutine(AStar(queue, endPos));
+        }
+
+        void popLogic(HexProperty hex)
+        {
+            hex.isInQueue = false;
+            hex.hasBeenChosen = true;
+            hex.Material.color = Color.green;
+        }
+        
+        private IEnumerator AStar(PriorityQueue<HexProperty> queue, Vector3Int endPos)
+        {
+            List<HexProperty> ChosenList = new List<HexProperty>();
+            bool findEndPoint = false;
+            while (queue.Count() > 0)
+            {
+                var hex = queue.GetTop();
+                queue.Pop();
+                popLogic(hex);
+                ChosenList.Add(hex);
+                // yield return new WaitForSeconds(0.5f);
+                if (hex.hexPosition == endPos)
+                {
+                    findEndPoint = true;
+                    break;
+                }
+                foreach (var tile in hex.adjacentTiles)
+                {
+                    if (tile.isInQueue == false && tile.hasBeenChosen == false)
+                    {
+                        tile.distanceToStart = hex.distanceToStart + tile.cost;
+                        tile.distanceToEnd = Math.Abs(endPos.x - tile.hexPosition.x) +
+                                             Math.Abs(endPos.y - tile.hexPosition.y) +
+                                             Math.Abs(endPos.z - tile.hexPosition.z);
+                        tile.evaluateDistance = tile.distanceToStart + tile.distanceToEnd;
+                        queue.Add(tile);
+                        tile.isInQueue = true;
+                        tile.parent = hex;
+                    }
+                    else if (tile.isInQueue == true)
+                    {
+                        int newDis2Start = hex.distanceToStart + tile.cost;
+                        int newDis2End = Math.Abs(endPos.x - tile.hexPosition.x) +
+                                         Math.Abs(endPos.y - tile.hexPosition.y) +
+                                         Math.Abs(endPos.z - tile.hexPosition.z);
+                        if (newDis2End + newDis2Start < tile.evaluateDistance)
+                        {
+                            tile.distanceToStart = newDis2Start;
+                            tile.distanceToEnd = newDis2End;
+                            tile.evaluateDistance = tile.distanceToStart + tile.distanceToEnd;
+                            tile.parent = hex;
+                        }
+                        
+                    }
+                }
+            }
+
+            if (findEndPoint == true)
+            {
+                var hex = m_PosToHex[endPos];
+                while (hex != null)
+                {
+                    lastPath.Add(hex);
+                    // hex.Material.color = Color.blue;
+                    hex.hasBeenChosen = false;
+                    hex = hex.parent;
+                    // yield return new WaitForSeconds(0.5f);
+                }
+            }
+
+            while (queue.Count() > 0)
+            {
+                var hex = queue.GetTop();
+                queue.Pop();
+                hex.isInQueue = false;
+            }
+
+            foreach (var hex in ChosenList)
+            {
+                hex.Material.color = Color.white;
+            }
+            ChosenList.Clear();
+            isNaving = false;
+            yield return null;
+            foreach (var hexProperty in lastPath)
+            {
+                hexProperty.Material.color = Color.blue;
+            }
+        }
+        #endregion
+
+
+        HexProperty GetClickedHex()
+        {
+            Ray ray = Camera.main.ScreenPointToRay(Input.mousePosition);
+            RaycastHit hit;
+            if (Physics.Raycast(ray, out hit))
+            {
+                var hex = hit.collider.transform.GetComponent<HexProperty>();
+                return hex;
+            }
+
+            return null;
+        }
+        
         /// <summary>
         /// 为六边形生成 邻格
         /// 先检查是否已经有邻格 从全局地图信息中查找 有 则生成
@@ -155,6 +319,7 @@ namespace MapCreation
             int childCount = GameObject.Find("Map").transform.childCount;
             List<Vector3Int> tmpList = new List<Vector3Int>();
             Vector3Int hexPos;
+            int cnt = 0;
             for (int i = 0; i < 6; ++i)
             {
                 hexPos = hex.hexPosition;
@@ -167,10 +332,11 @@ namespace MapCreation
                 }
                 var worldPos = hex.transform.position;
                 worldPos += _worldPosOffset[i];
-                var otherHex = GenerateHexObject(hexPos, worldPos, childCount + i);
+                var otherHex = GenerateHexObject(hexPos, worldPos, childCount + cnt);
                 hex.adjacentTiles.Add(otherHex);
                 m_MapInfo.hexPosInfo.Add(hexPos);
                 m_MapInfo.worldPosInfo.Add(worldPos);
+                ++cnt;
             }
 
             foreach (var vec3Int in tmpList)
@@ -180,6 +346,20 @@ namespace MapCreation
             }
         }
 
+        void DeleteHex(HexProperty hex)
+        {
+            foreach (var adjacentTile in hex.adjacentTiles)
+            {
+                adjacentTile.adjacentTiles.Remove(hex);
+            }
+
+            int pos = m_MapInfo.hexPosInfo.IndexOf(hex.hexPosition);
+            m_PosToHex.Remove(hex.hexPosition);
+            m_MapInfo.worldPosInfo.RemoveAt(pos);
+            m_MapInfo.hexPosInfo.RemoveAt(pos);
+            Destroy(hex.gameObject);
+        }
+        
         void UpdateList(HexProperty hex)
         {
             var hexPos = hex.hexPosition;
